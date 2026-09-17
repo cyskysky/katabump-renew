@@ -52,13 +52,18 @@ jobs:
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: |
+        # app.py 不返回退出码，所以按它打印的结果判定：
+        #   登录成功 / 续期成功 / 未到续期时间  → 本轮目的已达成，不再重试
+        #   其它（登录失败、页面异常）          → 重试
         for attempt in 1 2 3; do
           echo "===== 第 $attempt 次尝试 ====="
-          if xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py; then
-            echo "第 $attempt 次已成功"
+          output="$(xvfb-run --auto-servernum --server-args='-screen 0 1920x1080x24' python3 app.py 2>&1 || true)"
+          printf '%s\n' "$output"
+          if printf '%s' "$output" | grep -qE '登录成功|续期成功|未到续期时间|已静默通过'; then
+            echo "第 $attempt 次已完成"
             exit 0
           fi
-          echo "第 $attempt 次未成功，30 秒后重试"
+          echo "第 $attempt 次未通过，30 秒后重试"
           sleep 30
         done
         echo "三次尝试均未成功"

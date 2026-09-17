@@ -345,6 +345,27 @@ def _read_alert(sb):
         return ""
 
 
+def _read_expiry_days(sb):
+    """从服务器详情页读出到期日，返回距离今天的天数；读不到返回 None。
+
+    以页面上写着的时间为准，而不是本地记录：本地记的日期一旦有偏差就会误判，
+    而这里读到的是服务器当下真正认的到期时间。
+    """
+    import datetime
+    import re
+    try:
+        source = sb.get_page_source() or ""
+        match = re.search(r"Expiry[^0-9]{0,120}(\d{4}-\d{2}-\d{2})", source, re.S)
+        if not match:
+            match = re.search(r"(\d{4}-\d{2}-\d{2})", source)
+        if not match:
+            return None
+        target = datetime.date.fromisoformat(match.group(1))
+        return (target - datetime.date.today()).days
+    except Exception:
+        return None
+
+
 def _goto_server_detail(sb) -> bool:
     """在 Dashboard 首页查找并点击 See 进入服务器详情页"""
     print("\n🖥️  正在进入服务器续期页...")
@@ -354,6 +375,8 @@ def _goto_server_detail(sb) -> bool:
     alert_text = _read_alert(sb)
     if alert_text and "can't renew" in alert_text.lower():
         print(f"ℹ️  页面顶部提示: {alert_text}")
+        # 这个标记供 workflow 判定：窗口外没到该续期的时候，属正常状态而非失败。
+        print("尚未到续期窗口")
         send_tg_message("ℹ️", "⚠️ 未到续期时间", alert_text)
         return False
 
@@ -593,6 +616,15 @@ def renew_server(sb):
     print("#" * 25)
 
     if not _goto_server_detail(sb):
+        return
+
+    # 续期入口只在到期前一天开放。窗口外就到此为止：不点续期，也不让 workflow
+    # 把这轮当成失败去重试——本来就没有可做的事。
+    days = _read_expiry_days(sb)
+    if days is not None and days > 1:
+        print(f"ℹ️  距离到期还有 {days} 天，续期入口尚未开放，本轮不处理")
+        print("尚未到续期窗口")
+        send_tg_message("ℹ️", "未到续期窗口", f"距离到期还有 {days} 天")
         return
 
     if not _open_renew_modal(sb):

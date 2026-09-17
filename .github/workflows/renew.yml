@@ -1,13 +1,13 @@
 name: Katabump Auto Renew
 
 # 服务器每 4 天到期。分两层重试，尽量自己搞定：
-#   跨运行：每 6 小时一次，4 天里有 16 次机会；
+#   跨运行：每 3 小时一次，4 天里有 32 次机会；
 #   运行内：失败后等 10 分钟再试，最多 3 轮，扛住节点抖动一类的瞬时故障。
 # 未到续期时间时 app.py 会安全退出，所以密跑不会误操作。
 # 三次都失败时开 Issue 告警，把「轮到人接手」推到眼前。
 on:
   schedule:
-  - cron: '17 */6 * * *'
+  - cron: '17 */3 * * *'
   workflow_dispatch:
 
 jobs:
@@ -83,7 +83,7 @@ jobs:
       run: |
         existing=$(gh issue list --state open --search "Katabump 续期失败 in:title" --json number --jq '.[0].number')
         body=$(cat <<EOF
-        自动续期三轮均未成功（每轮间隔 10 分钟，跨运行每 6 小时还会再试）。
+        自动续期三轮均未成功（每轮间隔 10 分钟，跨运行每 3 小时还会再试）。
 
         如果连续多个周期都失败，**服务器会在 4 天内到期**，需要手动处理一次：
 

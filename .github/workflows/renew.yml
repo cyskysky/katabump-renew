@@ -1,16 +1,19 @@
 name: Katabump Auto Renew
 
-# 服务器每 4 天到期，所以每天跑两次：4 天内共有 8 次机会，任一次成功即可续上。
-# 未到续期时间时 app.py 会安全退出，不会误操作，多跑无副作用。
+# 服务器每 4 天到期。分两层重试，尽量自己搞定：
+#   跨运行：每 6 小时一次，4 天里有 16 次机会；
+#   运行内：失败后等 10 分钟再试，最多 3 轮，扛住节点抖动一类的瞬时故障。
+# 未到续期时间时 app.py 会安全退出，所以密跑不会误操作。
+# 三次都失败时开 Issue 告警，把「轮到人接手」推到眼前。
 on:
   schedule:
-  - cron: '17 1 * * *'
-  - cron: '17 13 * * *'
+  - cron: '17 */6 * * *'
   workflow_dispatch:
 
 jobs:
   Renew-Katabump:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       actions: write
       contents: read
@@ -46,28 +49,30 @@ jobs:
         fi
         python3 setup_multi_proxy.py
 
-    - name: 🚀 运行续期脚本（最多 3 次）
+    - name: 🚀 运行续期脚本（失败等 10 分钟再试，最多 3 轮）
       env:
         KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
         KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: |
-        # app.py 不返回退出码，所以按它打印的结果判定：
-        #   登录成功 / 续期成功 / 未到续期时间  → 本轮目的已达成，不再重试
-        #   其它（登录失败、页面异常）          → 重试
+        # app.py 不返回退出码，按它打印的结果判定：
+        #   登录成功 / 续期成功 / 未到续期时间 / 已静默通过 → 本轮目的已达成
+        #   其它（登录失败、页面异常）                     → 等一会再试
         for attempt in 1 2 3; do
-          echo "===== 第 $attempt 次尝试 ====="
+          echo "===== 第 $attempt 轮 ====="
           output="$(xvfb-run --auto-servernum --server-args='-screen 0 1920x1080x24' python3 app.py 2>&1 || true)"
           printf '%s\n' "$output"
           if printf '%s' "$output" | grep -qE '登录成功|续期成功|未到续期时间|已静默通过'; then
-            echo "第 $attempt 次已完成"
+            echo "第 $attempt 轮已完成，结束"
             exit 0
           fi
-          echo "第 $attempt 次未通过，30 秒后重试"
-          sleep 30
+          if [ "$attempt" -lt 3 ]; then
+            echo "第 $attempt 轮未通过，10 分钟后再试"
+            sleep 600
+          fi
         done
-        echo "三次尝试均未成功"
+        echo "三轮均未成功"
         exit 1
 
     - name: 🚨 失败告警（自动开 Issue，轮到人工接手）
@@ -78,16 +83,17 @@ jobs:
       run: |
         existing=$(gh issue list --state open --search "Katabump 续期失败 in:title" --json number --jq '.[0].number')
         body=$(cat <<EOF
-        自动续期三次全部未成功，**服务器会在 4 天内到期**，需要手动处理一次。
+        自动续期三轮均未成功（每轮间隔 10 分钟，跨运行每 6 小时还会再试）。
 
-        手动续期（约一分钟）：
+        如果连续多个周期都失败，**服务器会在 4 天内到期**，需要手动处理一次：
+
         1. 打开 https://dashboard.katabump.com/dashboard
         2. 找到 aicccc 这台服务器，点 See 进入详情
         3. 点 Renew，通过人机验证后提交
 
         排查线索：
         - 本次运行日志：$RUN_URL
-        - 多数失败原因是代理节点过不了 Cloudflare 盾，可换节点后手动触发一次 workflow
+        - 常见原因是代理节点过不了 Cloudflare 盾：可换节点后手动触发一次 workflow
 
         本条 Issue 在下次续期成功后会自动关闭。
         EOF
@@ -95,7 +101,7 @@ jobs:
         if [ -n "$existing" ]; then
           gh issue comment "$existing" --body "$body"
         else
-          gh issue create --title "Katabump 续期失败：需要手动续期" --body "$body"
+          gh issue create --title "Katabump 续期失败：需要人工处理" --body "$body"
         fi
 
     - name: ✅ 成功后关闭告警 Issue

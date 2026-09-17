@@ -1,19 +1,23 @@
 name: Katabump Auto Renew
 
+# 服务器每 4 天到期，所以每天跑两次：4 天内共有 8 次机会，任一次成功即可续上。
+# 未到续期时间时 app.py 会安全退出，不会误操作，多跑无副作用。
 on:
   schedule:
-  - cron: '0 2 */3 * *'  # 每天 UTC 0点 (北京时间 8点) 运行,根据服务到期时间自行修改
-  workflow_dispatch: # 允许手动触发
+  - cron: '17 1 * * *'
+  - cron: '17 13 * * *'
+  workflow_dispatch:
 
 jobs:
   Renew-Katabump:
     runs-on: ubuntu-latest
     permissions:
-      actions: write  
+      actions: write
       contents: read
-    
+
     steps:
     - uses: actions/checkout@v6
+
     - name: ⚙ 设置 Python
       uses: actions/setup-python@v6
       with:
@@ -22,27 +26,44 @@ jobs:
     - name: 🛠️ 安装系统依赖和python依赖
       run: |
         sudo apt-get update
-        sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
+        sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk curl
         pip install seleniumbase requests
         seleniumbase install chromedriver
 
-    - name: ⚙ 设置代理 (sing-box)
+    - name: ⚙ 设置代理（多订阅实时优选）
       continue-on-error: true
       env:
-        NODE_LINK: ${{ secrets.NODE_LINK }}
+        SUB_URLS: ${{ secrets.SUB_URLS }}
+        TOP_N: '8'
+        TEST_TIMEOUT: '5'
       run: |
-        bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+        curl -sL -o sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v1.13.16/sing-box-1.13.16-linux-amd64.tar.gz" || true
+        if [ -s sing-box.tar.gz ]; then
+          tar -xzf sing-box.tar.gz
+          mv sing-box-1.13.16-linux-amd64/sing-box ./sing-box
+          chmod +x sing-box
+        fi
+        python3 setup_multi_proxy.py
 
-    - name: 🚀 运行续期脚本
+    - name: 🚀 运行续期脚本（最多 3 次）
       env:
         KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
         KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: |
-        xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
-          python3 app.py
-        
+        for attempt in 1 2 3; do
+          echo "===== 第 $attempt 次尝试 ====="
+          if xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 app.py; then
+            echo "第 $attempt 次已成功"
+            exit 0
+          fi
+          echo "第 $attempt 次未成功，30 秒后重试"
+          sleep 30
+        done
+        echo "三次尝试均未成功"
+        exit 1
+
     - name: 🧹 清理旧的工作流运行记录
       if: always()
       env:

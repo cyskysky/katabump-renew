@@ -1,5 +1,95 @@
 name: Katabump Auto Renew
 
+# 续期入口只在到期前一天开放，所以策略是「密跑 + 窗口内判断」：
+#   cron 每小时一次，到期那天有 24 次机会；每次失败再等 10 分钟重试，最多 3 轮，
+#   合计约 72 次尝试。
+# 窗口外 app.py 会读到 Expiry 并立即退出，不会去点续期、也不会触发告警；
+# 仓库为公开仓库，Actions 不限时长，所以密度不带来成本。
+on:
+  schedule:
+  - cron: '17 * * * *'
+  workflow_dispatch:
+
+jobs:
+  Renew-Katabump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: ⚙ 设置 Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: 🛠️ 安装系统依赖和python依赖
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk curl
+        pip install seleniumbase requests
+        seleniumbase install chromedriver
+
+    - name: ⚙ 设置代理（多订阅实时优选）
+      continue-on-error: true
+      env:
+        SUB_URLS: ${{ secrets.SUB_URLS }}
+        TOP_N: '8'
+        TEST_TIMEOUT: '5'
+      run: |
+        curl -sL -o sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v1.13.16/sing-box-1.13.16-linux-amd64.tar.gz" || true
+        if [ -s sing-box.tar.gz ]; then
+          tar -xzf sing-box.tar.gz
+          mv sing-box-1.13.16-linux-amd64/sing-box ./sing-box
+          chmod +x sing-box
+        fi
+        python3 setup_multi_proxy.py
+
+    - name: 🚀 运行续期脚本（失败等 10 分钟再试，最多 3 轮）
+      env:
+        KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
+        KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
+        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      run: |
+        # app.py 不返回退出码，按它打印的结果判定：
+        #   登录成功 / 续期成功 / 未到续期时间 / 已静默通过 → 本轮目的已达成
+        #   其它（登录失败、页面异常）                     → 等一会再试
+        for attempt in 1 2 3; do
+          echo "===== 第 $attempt 轮 ====="
+          output="$(xvfb-run --auto-servernum --server-args='-screen 0 1920x1080x24' python3 app.py 2>&1 || true)"
+          printf '%s\n' "$output"
+          if printf '%s' "$output" | grep -qE '登录成功|续期成功|未到续期时间|已静默通过|尚未到续期窗口'; then
+            echo "第 $attempt 轮已完成，结束"
+            exit 0
+          fi
+          if [ "$attempt" -lt 3 ]; then
+            echo "第 $attempt 轮未通过，10 分钟后再试"
+            sleep 600
+          fi
+        done
+        echo "三轮均未成功"
+        exit 1
+
+    - name: 🧹 清理旧的工作流运行记录
+      if: always()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+        count=0
+        for run_id in $runs; do
+          count=$((count + 1))
+          if [ $count -gt 1 ]; then
+            echo "删除运行记录: $run_id"
+            gh run delete $run_id || true
+          fi
+        done
+name: Katabump Auto Renew
+
 # 服务器每 4 天到期。分两层重试，尽量自己搞定：
 #   跨运行：每 3 小时一次，4 天里有 32 次机会；
 #   运行内：失败后等 10 分钟再试，最多 3 轮，扛住节点抖动一类的瞬时故障。

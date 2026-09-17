@@ -190,14 +190,24 @@ def parse_node(link: str) -> dict | None:
             return outbound
 
         if scheme in {"ss", "shadowsocks"}:
-            raw = link.split("://", 1)[1].split("#", 1)[0]
-            raw = raw.split("?", 1)[0]
+            raw = link.split("://", 1)[1].split("#", 1)[0].split("?", 1)[0]
             if "@" in raw:
-                method_password = unquote(raw.rsplit("@", 1)[0])
+                # SIP002：@ 之前是 base64(method:password)，但也可能是明文 method:password。
+                # 先前漏了解码这一步，整个 base64 串被当成方法名，sing-box 直接 FATAL。
+                userinfo = unquote(raw.rsplit("@", 1)[0])
+                if ":" not in userinfo:
+                    try:
+                        padded = userinfo + "=" * (-len(userinfo) % 4)
+                        userinfo = base64.b64decode(padded).decode("utf-8", "replace")
+                    except (binascii.Error, ValueError, UnicodeDecodeError):
+                        pass
+                method_password = userinfo
             else:
                 padded = raw + "=" * (-len(raw) % 4)
                 method_password = base64.b64decode(padded).decode("utf-8", "replace")
             method, _, secret = method_password.partition(":")
+            if not method or not secret:
+                return None
             return {"type": "shadowsocks", "tag": "", "server": host, "server_port": port,
                     "method": method, "password": secret}
 
@@ -242,6 +252,27 @@ def latency(outbound: dict) -> float | None:
             return time.monotonic() - started
     except OSError:
         return None
+
+
+def verified(nodes: list[dict]) -> list[dict]:
+    """用 sing-box check 逐个校验，剔除它不认的节点。
+
+    订阅里会混进 sing-box 尚未支持的加密方法一类的东西，直接写进配置会让整个实例
+    FATAL 起不来，把同一批里的好节点一起废掉。所以落盘前先筛一遍。
+    """
+    good: list[dict] = []
+    probe = Path("sing-box-probe.json")
+    for node in nodes:
+        probe.write_text(json.dumps({"outbounds": [node]}, ensure_ascii=False), encoding="utf-8")
+        result = subprocess.run(["./sing-box", "check", "-c", str(probe)],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            good.append(node)
+        else:
+            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            log("剔除 sing-box 不识别的节点 %s: %s" % (node["tag"], detail[-1][:140] if detail else "(无输出)"))
+    probe.unlink(missing_ok=True)
+    return good
 
 
 def main() -> int:
@@ -296,6 +327,14 @@ def main() -> int:
             handle.write("IS_PROXY=false\n")
         return 1
 
+    # 连通不等于 sing-box 能用：先过一遍 check，免得一个坏节点拖垮整批。
+    picked = verified(picked)
+    if not picked:
+        log("连通节点都通不过 sing-box 校验，退回直连")
+        with open(os.environ.get("GITHUB_ENV", "/dev/null"), "a", encoding="utf-8") as handle:
+            handle.write("IS_PROXY=false\n")
+        return 1
+
     config = {
         "log": {"level": "warn"},
         "inbounds": [
@@ -345,4 +384,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

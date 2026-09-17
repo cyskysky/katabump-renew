@@ -1,9 +1,9 @@
 name: Katabump Auto Renew
 
 # 续期入口只在到期前一天开放，所以策略是「密跑 + 窗口内判断」：
-#   cron 每小时一次，到期那天有 24 次机会；每次失败再等 10 分钟重试，最多 3 轮，
+#   cron 每小时一次，到期那天有 24 次机会；每轮失败再等 10 分钟重试，最多 3 轮，
 #   合计约 72 次尝试。
-# 窗口外 app.py 会读到 Expiry 并立即退出，不会去点续期、也不会触发告警；
+# 窗口外 app.py 会读到 Expiry 并立即退出，不去点续期、也不触发失败重试。
 # 仓库为公开仓库，Actions 不限时长，所以密度不带来成本。
 on:
   schedule:
@@ -56,8 +56,8 @@ jobs:
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
       run: |
         # app.py 不返回退出码，按它打印的结果判定：
-        #   登录成功 / 续期成功 / 未到续期时间 / 已静默通过 → 本轮目的已达成
-        #   其它（登录失败、页面异常）                     → 等一会再试
+        #   登录成功 / 续期成功 / 未到续期时间 / 已静默通过 / 尚未到续期窗口 → 这轮目的已达成
+        #   其它（登录失败、页面异常）                                        → 等一会再试
         for attempt in 1 2 3; do
           echo "===== 第 $attempt 轮 ====="
           output="$(xvfb-run --auto-servernum --server-args='-screen 0 1920x1080x24' python3 app.py 2>&1 || true)"
@@ -73,136 +73,6 @@ jobs:
         done
         echo "三轮均未成功"
         exit 1
-
-    - name: 🧹 清理旧的工作流运行记录
-      if: always()
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
-        count=0
-        for run_id in $runs; do
-          count=$((count + 1))
-          if [ $count -gt 1 ]; then
-            echo "删除运行记录: $run_id"
-            gh run delete $run_id || true
-          fi
-        done
-name: Katabump Auto Renew
-
-# 服务器每 4 天到期。分两层重试，尽量自己搞定：
-#   跨运行：每 3 小时一次，4 天里有 32 次机会；
-#   运行内：失败后等 10 分钟再试，最多 3 轮，扛住节点抖动一类的瞬时故障。
-# 未到续期时间时 app.py 会安全退出，所以密跑不会误操作。
-# 三次都失败时开 Issue 告警，把「轮到人接手」推到眼前。
-on:
-  schedule:
-  - cron: '17 */3 * * *'
-  workflow_dispatch:
-
-jobs:
-  Renew-Katabump:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      actions: write
-      contents: read
-      issues: write
-
-    steps:
-    - uses: actions/checkout@v6
-
-    - name: ⚙ 设置 Python
-      uses: actions/setup-python@v6
-      with:
-        python-version: '3.12'
-
-    - name: 🛠️ 安装系统依赖和python依赖
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk curl
-        pip install seleniumbase requests
-        seleniumbase install chromedriver
-
-    - name: ⚙ 设置代理（多订阅实时优选）
-      continue-on-error: true
-      env:
-        SUB_URLS: ${{ secrets.SUB_URLS }}
-        TOP_N: '8'
-        TEST_TIMEOUT: '5'
-      run: |
-        curl -sL -o sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v1.13.16/sing-box-1.13.16-linux-amd64.tar.gz" || true
-        if [ -s sing-box.tar.gz ]; then
-          tar -xzf sing-box.tar.gz
-          mv sing-box-1.13.16-linux-amd64/sing-box ./sing-box
-          chmod +x sing-box
-        fi
-        python3 setup_multi_proxy.py
-
-    - name: 🚀 运行续期脚本（失败等 10 分钟再试，最多 3 轮）
-      env:
-        KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
-        KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
-        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-      run: |
-        # app.py 不返回退出码，按它打印的结果判定：
-        #   登录成功 / 续期成功 / 未到续期时间 / 已静默通过 → 本轮目的已达成
-        #   其它（登录失败、页面异常）                     → 等一会再试
-        for attempt in 1 2 3; do
-          echo "===== 第 $attempt 轮 ====="
-          output="$(xvfb-run --auto-servernum --server-args='-screen 0 1920x1080x24' python3 app.py 2>&1 || true)"
-          printf '%s\n' "$output"
-          if printf '%s' "$output" | grep -qE '登录成功|续期成功|未到续期时间|已静默通过'; then
-            echo "第 $attempt 轮已完成，结束"
-            exit 0
-          fi
-          if [ "$attempt" -lt 3 ]; then
-            echo "第 $attempt 轮未通过，10 分钟后再试"
-            sleep 600
-          fi
-        done
-        echo "三轮均未成功"
-        exit 1
-
-    - name: 🚨 失败告警（自动开 Issue，轮到人工接手）
-      if: failure()
-      env:
-        GH_TOKEN: ${{ github.token }}
-        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      run: |
-        existing=$(gh issue list --state open --search "Katabump 续期失败 in:title" --json number --jq '.[0].number')
-        body=$(cat <<EOF
-        自动续期三轮均未成功（每轮间隔 10 分钟，跨运行每 3 小时还会再试）。
-
-        如果连续多个周期都失败，**服务器会在 4 天内到期**，需要手动处理一次：
-
-        1. 打开 https://dashboard.katabump.com/dashboard
-        2. 找到 aicccc 这台服务器，点 See 进入详情
-        3. 点 Renew，通过人机验证后提交
-
-        排查线索：
-        - 本次运行日志：$RUN_URL
-        - 常见原因是代理节点过不了 Cloudflare 盾：可换节点后手动触发一次 workflow
-
-        本条 Issue 在下次续期成功后会自动关闭。
-        EOF
-        )
-        if [ -n "$existing" ]; then
-          gh issue comment "$existing" --body "$body"
-        else
-          gh issue create --title "Katabump 续期失败：需要人工处理" --body "$body"
-        fi
-
-    - name: ✅ 成功后关闭告警 Issue
-      if: success()
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        existing=$(gh issue list --state open --search "Katabump 续期失败 in:title" --json number --jq '.[0].number')
-        if [ -n "$existing" ]; then
-          gh issue close "$existing" --comment "本次自动续期已成功，关闭告警。"
-        fi
 
     - name: 🧹 清理旧的工作流运行记录
       if: always()

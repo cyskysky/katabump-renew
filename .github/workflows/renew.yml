@@ -14,6 +14,7 @@ jobs:
     permissions:
       actions: write
       contents: read
+      issues: write
 
     steps:
     - uses: actions/checkout@v6
@@ -68,6 +69,44 @@ jobs:
         done
         echo "三次尝试均未成功"
         exit 1
+
+    - name: 🚨 失败告警（自动开 Issue，轮到人工接手）
+      if: failure()
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        existing=$(gh issue list --state open --search "Katabump 续期失败 in:title" --json number --jq '.[0].number')
+        body=$(cat <<EOF
+        自动续期三次全部未成功，**服务器会在 4 天内到期**，需要手动处理一次。
+
+        手动续期（约一分钟）：
+        1. 打开 https://dashboard.katabump.com/dashboard
+        2. 找到 aicccc 这台服务器，点 See 进入详情
+        3. 点 Renew，通过人机验证后提交
+
+        排查线索：
+        - 本次运行日志：$RUN_URL
+        - 多数失败原因是代理节点过不了 Cloudflare 盾，可换节点后手动触发一次 workflow
+
+        本条 Issue 在下次续期成功后会自动关闭。
+        EOF
+        )
+        if [ -n "$existing" ]; then
+          gh issue comment "$existing" --body "$body"
+        else
+          gh issue create --title "Katabump 续期失败：需要手动续期" --body "$body"
+        fi
+
+    - name: ✅ 成功后关闭告警 Issue
+      if: success()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        existing=$(gh issue list --state open --search "Katabump 续期失败 in:title" --json number --jq '.[0].number')
+        if [ -n "$existing" ]; then
+          gh issue close "$existing" --comment "本次自动续期已成功，关闭告警。"
+        fi
 
     - name: 🧹 清理旧的工作流运行记录
       if: always()
